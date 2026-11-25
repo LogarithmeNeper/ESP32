@@ -48,4 +48,4 @@ struct Provider {
 
 struct Pt {
     float x, y;
-  };
+};
