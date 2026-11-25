@@ -10,6 +10,10 @@ struct Flight {
   int   speedKt = 0;
   float distKm = 0;
   float bearing = 0;
+  float lat = 0;
+  float lon = 0;
+  float track = 0;
+  bool  hasTrack = false;
   bool  routeKnown = false;
   char  origin[8] = "";
   char  dest[8] = "";
@@ -41,3 +45,7 @@ struct Provider {
   int         used;
   Backoff     bo;
 };
+
+struct Pt {
+    float x, y;
+  };
