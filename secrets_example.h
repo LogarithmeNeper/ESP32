@@ -6,4 +6,5 @@
 #define HOME_LAT   0.0
 #define HOME_LON   0.0
 
+#define NTFY_URL   "https://ntfy.sh/choose-a-long-random-topic"
 #define NTFY_TOPIC "choose-a-long-random-topic"
