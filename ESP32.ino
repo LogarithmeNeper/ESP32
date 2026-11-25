@@ -5,61 +5,92 @@
 #include <TFT_eSPI.h>
 #include <math.h>
 #include <time.h>
+#include "driver/gpio.h"
+#include "esp_sleep.h"
 #include "secrets.h"   // WIFI_SSID, WIFI_PASS, HOME_LAT, HOME_LON
+#include "types.h"     // Flight, RouteEntry, Backoff, Provider
 
 // ================= CONFIG (non-secret) =================
-const int    RADIUS_NM = 15;
+const int    RADIUS_NM = 15;                // search radius, nautical miles
+const int    MAX_ALT_FT = 15000;            // ignore aircraft at or above this altitude
 const bool   SHOW_GROUND = false;
 const bool   SHOW_ROUTE = true;
-const unsigned long POLL_MS = 10000;
+const unsigned long POLL_MS = 30000;        // update every 30 seconds
 
-const bool   SOUND_ON = true;
-const int    SOUND_VOLUME = 40;        // 1-100
-const int    QUIET_START = 22;         // no sound from this hour...
-const int    QUIET_END = 8;            // ...until this hour
-const float  ALERT_KM = 3.0;           // "fly-over" alert distance
-const int    ALERT_MAX_ALT_FT = 10000; // ...and maximum altitude
+const int    SLEEP_START_HOUR = 1;          // deep sleep from 01:00...
+const int    WAKE_HOUR = 9;                 // ...until 09:00
 const char*  TZ_PARIS = "CET-1CEST,M3.5.0,M10.5.0/3";
-const int    SPEAKER_PIN = 26;
-
-const char* RARE_TYPES[] = {"A388", "A225", "A124", "B748", "B744",
-                            "BLCF", "C5M", "C17", "A400", "B52"};
+const int    BACKLIGHT_PIN = 21;
 // =======================================================
+
+// Position feeds, all ADSBExchange-v2-compatible. dailyBudget is OUR self-imposed
+// limit per day (kept under each provider's real limit). Edit freely.
+Provider providers[] = {
+  {"adsb.lol",       "https://api.adsb.lol/v2",          0, 4000, 0, {0, 0}},
+  {"airplanes.live", "https://api.airplanes.live/v2",    0,  450, 0, {0, 0}},
+  {"adsb.fi",        "https://opendata.adsb.fi/api/v2",  1, 2000, 0, {0, 0}},
+};
+const int PROV_N = sizeof(providers) / sizeof(providers[0]);
 
 TFT_eSPI tft = TFT_eSPI();
 
 uint16_t C_BG, C_CARD, C_MUTED, C_ACCENT, C_CYAN, C_GREEN, C_RED, C_WHITE;
 uint16_t statusColor;
 
-struct Flight {
-  bool  valid = false;
-  char  callsign[10] = "";
-  char  type[8] = "";
-  char  reg[12] = "";
-  int   altFt = 0;
-  bool  onGround = false;
-  int   speedKt = 0;
-  float distKm = 0;
-  float bearing = 0;
-  bool  routeKnown = false;
-  char  origin[8] = "";
-  char  dest[8] = "";
-  char  originCity[24] = "";
-  char  destCity[24] = "";
-  char  airline[24] = "";
-};
+// ---------- back-off after errors / rate limiting ----------
+Backoff routeBackoff;
+
+void backoffFail(Backoff &b, unsigned long retryAfterMs = 0) {
+  if (retryAfterMs) {
+    b.delayMs = (retryAfterMs > 600000UL) ? 600000UL : retryAfterMs;
+  } else {
+    unsigned long next = b.delayMs ? b.delayMs * 2 : 30000UL;   // 30 s, 60 s, 120 s...
+    b.delayMs = (next > 600000UL) ? 600000UL : next;            // max 10 min
+  }
+  b.until = millis() + b.delayMs;
+  Serial.printf("Backing off for %lu s\n", b.delayMs / 1000);
+}
+void backoffOk(Backoff &b) { b.delayMs = 0; b.until = 0; }
+bool backoffActive(const Backoff &b) { return b.until != 0 && (long)(b.until - millis()) > 0; }
+
+// ---------- provider rotation ----------
+int lastYday = -1;
+unsigned long lastResetMs = 0;
+
+void resetBudgetsIfNewDay() {
+  struct tm t;
+  bool reset = false;
+  if (getLocalTime(&t, 0)) {
+    if (t.tm_yday != lastYday) {
+      reset = (lastYday != -1);
+      lastYday = t.tm_yday;
+    }
+  } else if (millis() - lastResetMs > 86400000UL) {
+    reset = true;                                  // no clock: reset every 24 h
+  }
+  if (reset) {
+    for (int i = 0; i < PROV_N; i++) providers[i].used = 0;
+    lastResetMs = millis();
+    Serial.println("Daily request budgets reset");
+  }
+}
+
+// provider with the lowest share of its budget used, skipping those backing off
+int pickProvider() {
+  int best = -1;
+  float bestRatio = 1e9;
+  for (int i = 0; i < PROV_N; i++) {
+    Provider &p = providers[i];
+    if (backoffActive(p.bo)) continue;
+    if (p.used >= p.dailyBudget) continue;
+    float ratio = (float)p.used / p.dailyBudget;
+    if (ratio < bestRatio) { bestRatio = ratio; best = i; }
+  }
+  return best;
+}
 
 // ---------- route cache ----------
-const int ROUTE_CACHE_N = 10;
-struct RouteEntry {
-  char callsign[10];
-  bool known;
-  char orig[8];
-  char dest[8];
-  char origCity[24];
-  char destCity[24];
-  char airline[24];
-};
+const int ROUTE_CACHE_N = 30;
 RouteEntry routeCache[ROUTE_CACHE_N];
 int routeCacheNext = 0;
 
@@ -104,42 +135,44 @@ const char* compass(float b) {
   return d[(int)((b + 22.5f) / 45.0f) % 8];
 }
 
-// ---------- sound ----------
-void playTone(int freq, int ms) {
-  if (!SOUND_ON) return;
-  if (freq <= 0) { delay(ms); return; }
-  int amp = constrain(SOUND_VOLUME, 1, 100) * 127 / 100;
-  unsigned long half = 500000UL / freq;
-  unsigned long end = millis() + ms;
-  while (millis() < end) {
-    dacWrite(SPEAKER_PIN, 128 + amp);
-    delayMicroseconds(half);
-    dacWrite(SPEAKER_PIN, 128 - amp);
-    delayMicroseconds(half);
+// ---------- sleep schedule ----------
+bool inSleepWindow(int hour) {
+  if (SLEEP_START_HOUR < WAKE_HOUR) return hour >= SLEEP_START_HOUR && hour < WAKE_HOUR;
+  return hour >= SLEEP_START_HOUR || hour < WAKE_HOUR;          // window crosses midnight
+}
+
+long secondsUntilWake(const struct tm &t) {
+  long nowS = t.tm_hour * 3600L + t.tm_min * 60L + t.tm_sec;
+  long d = WAKE_HOUR * 3600L - nowS;
+  if (d <= 0) d += 86400L;
+  return d;
+}
+
+// The ESP32 sleep timer drifts by a few percent, so sleep ~90% of the remaining
+// time, wake, re-check the clock, and repeat. This keeps wake-up near the target.
+long sleepChunk(long remaining) {
+  return (remaining > 300) ? remaining * 9 / 10 : remaining;
+}
+
+void goToSleep(long seconds, bool showMessage) {
+  if (showMessage) {
+    char buf[32];
+    snprintf(buf, sizeof(buf), "Sleeping until %02d:00", WAKE_HOUR);
+    tft.fillScreen(C_BG);
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextColor(C_MUTED, C_BG);
+    tft.drawString(buf, 160, 120, 4);
+    delay(3000);
   }
-  dacWrite(SPEAKER_PIN, 128);
-}
-
-void soundStartup()   { playTone(523, 90); playTone(659, 90); playTone(784, 90); playTone(1047, 220); }
-void soundNewFlight() { playTone(880, 90); playTone(0, 30); playTone(1175, 170); }
-void soundOverhead()  { for (int i = 0; i < 3; i++) { playTone(1000, 70); playTone(0, 60); } }
-void soundRare() {
-  int n[] = {523, 659, 784, 1047, 1319};
-  for (int i = 0; i < 5; i++) playTone(n[i], 80);
-  playTone(1568, 320);
-}
-
-bool isRare(const char* t) {
-  for (const char* r : RARE_TYPES) if (strcmp(t, r) == 0) return true;
-  return false;
-}
-
-bool isQuiet() {
-  struct tm t;
-  if (!getLocalTime(&t, 0)) return false;      // time unknown: don't mute
-  int h = t.tm_hour;
-  if (QUIET_START > QUIET_END) return h >= QUIET_START || h < QUIET_END;
-  return h >= QUIET_START && h < QUIET_END;
+  digitalWrite(BACKLIGHT_PIN, LOW);
+  tft.writecommand(0x28);                          // display off
+  gpio_hold_en((gpio_num_t)BACKLIGHT_PIN);         // keep backlight off during sleep
+  gpio_deep_sleep_hold_en();
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  Serial.printf("Deep sleep for %ld s\n", seconds);
+  esp_sleep_enable_timer_wakeup((uint64_t)seconds * 1000000ULL);
+  esp_deep_sleep_start();
 }
 
 // ---------- network ----------
@@ -151,12 +184,20 @@ void connectWiFi() {
   while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) delay(250);
 }
 
-// returns number of aircraft found, or -1 on error
-int fetchNearest(Flight &best) {
+// One attempt against one provider. Returns aircraft count, or -1 on failure
+// (in which case that provider is put in back-off).
+int fetchFrom(Provider &p, Flight &best) {
   best = Flight();
 
-  String url = "https://api.adsb.lol/v2/point/" + String(HOME_LAT, 5) + "/" +
-               String(HOME_LON, 5) + "/" + String(RADIUS_NM);
+  String url = String(p.base);
+  if (p.style == 0) {
+    url += "/point/" + String(HOME_LAT, 5) + "/" + String(HOME_LON, 5) + "/" + String(RADIUS_NM);
+  } else {
+    url += "/lat/" + String(HOME_LAT, 5) + "/lon/" + String(HOME_LON, 5) + "/dist/" + String(RADIUS_NM);
+  }
+
+  p.used++;
+  Serial.printf("Using %s (%d/%d today)\n", p.name, p.used, p.dailyBudget);
 
   WiFiClientSecure client;
   client.setInsecure();
@@ -164,13 +205,17 @@ int fetchNearest(Flight &best) {
   http.setTimeout(8000);
   http.setUserAgent("esp32-flight-panel/1.0");
   http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
-  if (!http.begin(client, url)) return -1;
+  if (!http.begin(client, url)) { backoffFail(p.bo); return -1; }
+
+  const char* keys[] = {"Retry-After"};
+  http.collectHeaders(keys, 1);
 
   int code = http.GET();
   if (code != 200) {
-    Serial.printf("HTTP error %d (%s)\n", code, http.errorToString(code).c_str());
-    Serial.printf("Free heap: %u\n", ESP.getFreeHeap());
+    Serial.printf("HTTP error %d (%s) from %s\n", code, http.errorToString(code).c_str(), p.name);
+    unsigned long ra = (code == 429) ? (unsigned long)http.header("Retry-After").toInt() * 1000UL : 0;
     http.end();
+    backoffFail(p.bo, ra);
     return -1;
   }
 
@@ -188,9 +233,11 @@ int fetchNearest(Flight &best) {
       deserializeJson(doc, payload, DeserializationOption::Filter(filter));
   payload = "";
   if (err) {
-    Serial.printf("JSON error: %s\n", err.c_str());
+    Serial.printf("JSON error from %s: %s\n", p.name, err.c_str());
+    backoffFail(p.bo);
     return -1;
   }
+  backoffOk(p.bo);
 
   JsonArray ac = doc["ac"].as<JsonArray>();
   int count = 0;
@@ -199,12 +246,16 @@ int fetchNearest(Flight &best) {
   for (JsonObject a : ac) {
     if (a["lat"].isNull() || a["lon"].isNull()) continue;
 
+    JsonVariant v = a["alt_baro"];
+    if (v.isNull()) continue;                      // unknown altitude: skip
+
     bool ground = false;
     int alt = 0;
-    JsonVariant v = a["alt_baro"];
-    if (v.is<const char*>()) ground = true;
+    if (v.is<const char*>()) ground = true;        // value is "ground"
     else alt = v.as<int>();
+
     if (ground && !SHOW_GROUND) continue;
+    if (!ground && alt >= MAX_ALT_FT) continue;    // too high to see or hear
 
     count++;
     float d = haversineKm(HOME_LAT, HOME_LON, a["lat"], a["lon"]);
@@ -226,10 +277,24 @@ int fetchNearest(Flight &best) {
   return count;
 }
 
+// Tries providers in order of least-used until one works.
+// Returns aircraft count, -1 on error, -2 if every provider is waiting/exhausted.
+int fetchNearest(Flight &best) {
+  best = Flight();
+  for (int attempt = 0; attempt < PROV_N; attempt++) {
+    int i = pickProvider();
+    if (i < 0) return (attempt == 0) ? -2 : -1;
+    int r = fetchFrom(providers[i], best);
+    if (r >= 0) return r;
+  }
+  return -1;
+}
+
 // Looks up origin/destination/airline for a callsign and caches it.
-// Returns false only on a transient failure (so we retry next time).
+// Returns false only on a transient failure (so we retry later).
 bool lookupRoute(const char* callsign) {
   if (findRoute(callsign)) return true;
+  if (backoffActive(routeBackoff)) return false;
 
   String url = String("https://api.adsbdb.com/v0/callsign/") + callsign;
 
@@ -248,8 +313,10 @@ bool lookupRoute(const char* callsign) {
 
   if (code != 200 && code != 404) {
     Serial.printf("Route lookup error %d\n", code);
+    if (code == 429 || code >= 500) backoffFail(routeBackoff);
     return false;
   }
+  backoffOk(routeBackoff);
 
   RouteEntry e = {};
   strlcpy(e.callsign, callsign, sizeof(e.callsign));
@@ -389,7 +456,7 @@ void drawFlight(const Flight &fl, int count, bool error) {
     tft.setTextColor(C_WHITE, C_BG);
     tft.drawString("Clear skies", 160, 105, 4);
     tft.setTextColor(C_MUTED, C_BG);
-    tft.drawString("no aircraft within " + String(RADIUS_NM) + " nm", 160, 140, 2);
+    tft.drawString("nothing below " + String(MAX_ALT_FT) + " ft within " + String(RADIUS_NM) + " nm", 160, 140, 2);
     return;
   }
 
@@ -418,8 +485,7 @@ void drawFlight(const Flight &fl, int count, bool error) {
   // stat tiles
   String alt;
   if (fl.onGround) alt = "GND";
-  else if (fl.altFt >= 18000) alt = "FL" + String(fl.altFt / 100);
-  else alt = String(fl.altFt);
+  else alt = String(fl.altFt);                     // always below 18,000 ft here
   drawTile(8,   178, "ALTITUDE (ft)", alt, C_GREEN);
   drawTile(111, 178, "SPEED (kt)", String(fl.speedKt), C_CYAN);
   drawTile(214, 178, "DISTANCE (km)", String(fl.distKm, 1), C_WHITE);
@@ -431,41 +497,64 @@ void drawFlight(const Flight &fl, int count, bool error) {
   tft.setTextColor(C_MUTED, C_BG);
   tft.drawString(left, 10, 224, 2);
   tft.setTextDatum(TR_DATUM);
-  tft.drawString(String(count) + " in range", 310, 224, 2);
+  tft.drawString(String(count) + " below " + String(MAX_ALT_FT / 1000) + "k ft", 310, 224, 2);
 }
 
 // ---------- main ----------
 unsigned long lastPoll = 0;
 int lastMinute = -1;
-char lastId[12] = "";
 
 void setup() {
   Serial.begin(115200);
-  pinMode(21, OUTPUT);
-  digitalWrite(21, HIGH);              // backlight
+
+  // wake-up handling: after a timer wake-up keep the screen dark until we know it's morning
+  bool timerWake = (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER);
+  gpio_deep_sleep_hold_dis();
+  gpio_hold_dis((gpio_num_t)BACKLIGHT_PIN);
+
+  pinMode(BACKLIGHT_PIN, OUTPUT);
+  digitalWrite(BACKLIGHT_PIN, timerWake ? LOW : HIGH);
+
   tft.init();
   tft.setRotation(1);
   initColors();
   tft.fillScreen(C_BG);
+  if (!timerWake) drawHeader(TFT_ORANGE);
 
-  drawHeader(TFT_ORANGE);
   connectWiFi();
   configTzTime(TZ_PARIS, "pool.ntp.org", "time.google.com");
 
-  soundStartup();                      // doubles as a speaker test
-  lastPoll = millis() - POLL_MS;
+  struct tm t;
+  bool haveTime = getLocalTime(&t, 10000);         // wait up to 10 s for NTP
+  if (haveTime && inSleepWindow(t.tm_hour)) {
+    goToSleep(sleepChunk(secondsUntilWake(t)), !timerWake);
+  } else if (!haveTime && timerWake) {
+    goToSleep(600, false);                         // no clock yet: retry in 10 min, screen stays off
+  }
+
+  if (timerWake) {                                 // it's morning: turn the screen on
+    digitalWrite(BACKLIGHT_PIN, HIGH);
+    drawHeader(TFT_ORANGE);
+  }
+
+  lastResetMs = millis();
+  lastPoll = millis() - POLL_MS;                   // poll immediately
 }
 
 void loop() {
-  // refresh the clock when the minute changes
   struct tm t;
   if (getLocalTime(&t, 0) && t.tm_min != lastMinute) {
     lastMinute = t.tm_min;
-    drawHeader(statusColor);
+    if (inSleepWindow(t.tm_hour)) {
+      goToSleep(sleepChunk(secondsUntilWake(t)), true);
+    }
+    drawHeader(statusColor);                       // refresh the clock
   }
 
   if (millis() - lastPoll < POLL_MS) return;
   lastPoll = millis();
+
+  resetBudgetsIfNewDay();
 
   if (WiFi.status() != WL_CONNECTED) {
     drawHeader(C_RED);
@@ -477,6 +566,10 @@ void loop() {
   Flight fl;
   int n = fetchNearest(fl);
 
+  if (n == -2) {                                   // all providers waiting: keep last screen
+    drawHeader(C_ACCENT);
+    return;
+  }
   if (n < 0) {
     drawHeader(C_RED);
     drawFlight(fl, 0, true);
@@ -498,17 +591,4 @@ void loop() {
 
   drawHeader(C_GREEN);
   drawFlight(fl, n, false);
-
-  // sound when a new nearest flight appears
-  if (fl.valid) {
-    const char* id = fl.callsign[0] ? fl.callsign : fl.reg;
-    if (id[0] && strcmp(id, lastId) != 0) {
-      strlcpy(lastId, id, sizeof(lastId));
-      if (!isQuiet()) {
-        if (isRare(fl.type)) soundRare();
-        else if (!fl.onGround && fl.distKm < ALERT_KM && fl.altFt < ALERT_MAX_ALT_FT) soundOverhead();
-        else soundNewFlight();
-      }
-    }
-  }
 }
